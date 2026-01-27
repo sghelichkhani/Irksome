@@ -381,12 +381,12 @@ class AdaptiveTimeStepper(StageDerivativeTimeStepper):
             dt_old = float(self.dt_old)
             dt_current = float(self.dt)
             tol = float(self.tol)
-            dt_pred = dt_current*((dt_current*tol)/err_current)**(1/self.butcher_tableau.embedded_order)
+            dt_pred = dt_current*(tol/err_current)**(1/self.butcher_tableau.embedded_order)
             self.print("\tTruncation error is %e" % (err_current))
 
             # Rejected step shrinks the time-step
-            if err_current >= dt_current*tol:
-                dtnew = dt_current*(self.safety_factor*dt_current*tol/err_current)**(1./self.butcher_tableau.embedded_order)
+            if err_current >= tol:
+                dtnew = dt_current*(self.safety_factor*tol/err_current)**(1./self.butcher_tableau.embedded_order)
                 self.print("\tShrinking time-step to %e" % (dtnew))
                 self.dt.assign(dtnew)
                 self.contreject += 1
@@ -407,7 +407,7 @@ class AdaptiveTimeStepper(StageDerivativeTimeStepper):
             # Accepted step increases the time-step
             else:
                 if dt_old != 0.0 and err_old != 0.0 and dt_current < self.dt_max:
-                    dtnew = min(dt_current*((dt_current*tol)/err_current)**self.KI*(err_old/err_current)**self.KP*(dt_current/dt_old)**self.KP, self.dt_max)
+                    dtnew = min(dt_current*(tol/err_current)**self.KI*(err_old/err_current)**self.KP*(dt_current/dt_old)**self.KP, self.dt_max)
                     self.print("\tThe step was accepted and the new time-step is %e" % (dtnew))
                 else:
                     dtnew = min(dt_current, self.dt_max)
