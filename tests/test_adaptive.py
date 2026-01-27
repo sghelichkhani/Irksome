@@ -223,3 +223,61 @@ def test_adapt_vector_heat(N, butcher_tableau):
 def test_adapt_mixed_heat(N, butcher_tableau):
     error = adapt_mixed_heat(N, butcher_tableau(3))
     assert abs(error) < 1e-10
+
+
+def test_adaptive_tolerance_scaling():
+    """Test that adaptive stepping correctly compares error to tolerance.
+
+    This test verifies the fix for a bug where the rejection condition was
+    `error >= dt*tol` instead of `error >= tol`. The bug caused dt to cancel
+    out in the rejection condition (since error ∝ dt), making rejection
+    independent of timestep size.
+
+    With the bug, steps were rejected even when error was well below tolerance.
+    """
+    msh = UnitSquareMesh(4, 4)
+
+    MC = MeshConstant(msh)
+    dt = MC.Constant(0.01)
+    t = MC.Constant(0.0)
+
+    V = FunctionSpace(msh, "CG", 1)
+    x, y = SpatialCoordinate(msh)
+
+    # Exponential decay creates meaningful truncation error
+    uexact = sin(pi*x)*sin(pi*y)*exp(-10*t)
+    rhs = Dt(uexact) - div(grad(uexact))
+
+    u = Function(V)
+    u.interpolate(uexact)
+
+    v = TestFunction(V)
+    F = inner(Dt(u), v)*dx + inner(grad(u), grad(v))*dx - inner(rhs, v)*dx
+
+    bc = DirichletBC(V, uexact, "on_boundary")
+
+    luparams = {"mat_type": "aij",
+                "snes_type": "ksponly",
+                "ksp_type": "preonly",
+                "pc_type": "lu"}
+
+    # With dt=0.01, this problem produces error ≈ 4.3e-5
+    # Setting tol=1e-3: error is 23x below tolerance
+    #
+    # OLD buggy code: error >= dt*tol → 4.3e-5 >= 1e-5 → REJECT (wrong!)
+    # NEW fixed code: error >= tol   → 4.3e-5 >= 1e-3 → ACCEPT (correct!)
+    stepper = TimeStepper(F, RadauIIA(3), t, dt, u, bcs=bc,
+                          solver_parameters=luparams,
+                          stage_type="deriv",
+                          adaptive_parameters={
+                              "tol": 1e-3,
+                              "dtmax": 0.01,  # Prevent initial scaling
+                              "max_reject": 3  # Fail fast with old code
+                          })
+
+    # With buggy code this raises RuntimeError (rejected 3 times)
+    err, dt_used = stepper.advance()
+
+    # Verify step was accepted and error is below tolerance
+    assert stepper.num_steps == 1
+    assert err < 1e-3
