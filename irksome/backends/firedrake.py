@@ -28,10 +28,9 @@ def get_stages(V: firedrake.FunctionSpace, num_stages: int) -> firedrake.Functio
 class MeshConstant(object):
     def __init__(self, msh: ufl.Mesh):
         self.msh = ufl.domain.as_domain(msh)
-        self.V = firedrake.FunctionSpace(self.msh, "R", 0)
 
     def Constant(self, val=0.0) -> ufl.Coefficient:
-        return firedrake.Function(self.V).assign(val)
+        return firedrake.Constant(val)
 
 
 def get_mesh_constant(MC: MeshConstant | None):
