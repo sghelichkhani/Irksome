@@ -8,7 +8,7 @@ from firedrake.bcs import EquationBC, EquationBCSplit
 from ufl.constantvalue import as_ufl
 from .constant import vecconst
 from .tools import AI, dot, replace, reshape, fields_to_components
-from .ufl.deriv import Dt, TimeDerivative, expand_time_derivatives
+from .ufl.deriv import Dt, TimeDerivative, expand_time_derivatives, check_no_conservative_dt
 from .bcs import EmbeddedBCData, BCStageData, extract_bcs, bc2space, stage2spaces4bc
 from .ufl.manipulation import extract_terms
 from .base_time_stepper import StageCoupledTimeStepper
@@ -55,6 +55,8 @@ def getForm(F, butch, t, dt, u0, stages, bcs=None, bc_type=None, splitting=AI, a
     """
     if bc_type is None:
         bc_type = "DAE"
+
+    check_no_conservative_dt(F)
 
     # preprocess time derivatives
     F = expand_time_derivatives(F, t=t, timedep_coeffs=(u0,))

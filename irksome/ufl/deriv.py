@@ -32,11 +32,61 @@ class TimeDerivative(Derivative):
         return "d{%s}/dt" % (self.ufl_operands[0],)
 
 
+@ufl_type(num_ops=1,
+          inherit_shape_from_operand=0,
+          inherit_indices_from_operand=0)
+class ConservativeTimeDerivative(Derivative):
+    """UFL node representing a conservative (finite-difference) time derivative.
+
+    Unlike :class:`TimeDerivative`, this node is *not* expanded via the chain
+    rule during :func:`expand_time_derivatives`.  Instead, DIRK steppers
+    discretise it as a finite difference of the operand expression:
+
+        ConservativeDt(f(u))  -->  (f(u_new) - f(u_old)) / dt
+
+    This preserves the nonlinear structure of ``f`` and is essential for
+    mass-conservative discretisations of equations like Richards', where the
+    accumulated quantity (e.g. moisture content theta) is a nonlinear function
+    of the prognostic variable (e.g. pressure head h).
+
+    For multi-stage DIRK methods, the finite difference is constructed using
+    cumulative b-weighted update points W_i = u0 + dt * sum_{j<=i} b_j * K_j,
+    giving a per-stage term (f(W_i) - f(W_{i-1})) / (b_i * dt) whose
+    telescoping sum yields exact global conservation:
+    f(u_new) - f(u_old) = sum_i (f(W_i) - f(W_{i-1})).
+    """
+    __slots__ = ()
+
+    def __new__(cls, f):
+        return Derivative.__new__(cls)
+
+    def __init__(self, f):
+        Derivative.__init__(self, (f,))
+
+    def __str__(self):
+        return "d_conservative{%s}/dt" % (self.ufl_operands[0],)
+
+
 def Dt(f, order=1):
     """Short-hand function to produce a :class:`TimeDerivative` of a given order."""
     for k in range(order):
         f = TimeDerivative(f)
     return f
+
+
+def ConservativeDt(f):
+    """Short-hand for a :class:`ConservativeTimeDerivative`.
+
+    Use this instead of :func:`Dt` when the time derivative wraps a nonlinear
+    function of the prognostic variable and mass conservation is required.
+
+    Example::
+
+        # Standard (chain rule): Dt(theta(h)) expands to C(h)*Dt(h)
+        # Conservative (finite diff): ConservativeDt(theta(h)) stays intact
+        F = inner(v, ConservativeDt(theta(h))) * dx + spatial_terms
+    """
+    return ConservativeTimeDerivative(f)
 
 
 class TimeDerivativeRuleset(GenericDerivativeRuleset):
@@ -112,6 +162,12 @@ class TimeDerivativeRuleDispatcher(DAGTraverser):
         f, = o.ufl_operands
         return self.rules(f)
 
+    @process.register(ConservativeTimeDerivative)
+    def conservative_time_derivative(self, o):
+        # Do NOT apply the chain rule.  Leave intact for the DIRK stepper
+        # to replace with a finite difference.
+        return o
+
     @process.register(Expr)
     @process.register(BaseForm)
     def _generic(self, o):
@@ -127,3 +183,16 @@ def expand_time_derivatives(expression, t=None, timedep_coeffs=None):
     expression = apply_algebra_lowering(expression)
     expression = apply_time_derivatives(expression, t=t, timedep_coeffs=timedep_coeffs)
     return expression
+
+
+def check_no_conservative_dt(F):
+    """Raise NotImplementedError if the form contains ConservativeTimeDerivative.
+
+    Call this from non-DIRK steppers that do not support ConservativeDt."""
+    from ufl.algorithms.analysis import extract_type
+    if extract_type(F, ConservativeTimeDerivative):
+        raise NotImplementedError(
+            "ConservativeDt is only supported with DIRK time steppers "
+            "(DIRKTimeStepper).  Use standard Dt for stage-coupled, "
+            "Galerkin, or explicit methods."
+        )

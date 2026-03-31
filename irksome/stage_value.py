@@ -10,7 +10,7 @@ from ufl.constantvalue import as_ufl
 
 from .bcs import stage2spaces4bc
 from .tableaux.ButcherTableaux import CollocationButcherTableau
-from .ufl.deriv import expand_time_derivatives
+from .ufl.deriv import expand_time_derivatives, check_no_conservative_dt
 from .ufl.manipulation import extract_terms, strip_dt_form
 from .tools import AI, is_ode, dot, reshape, replace
 from .constant import vecconst
@@ -73,6 +73,8 @@ def getFormStage(F, butch, t, dt, u0, stages, bcs=None, splitting=AI, vandermond
        - `bcnew`, a list of :class:`firedrake.DirichletBC` objects to be posed
          on the stages
     """
+    check_no_conservative_dt(F)
+
     # preprocess time derivatives
     F = expand_time_derivatives(F, t=t, timedep_coeffs=(u0,))
     # we can only do DAE-type problems correctly if one assumes a stiffly-accurate method.

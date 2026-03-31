@@ -2,16 +2,49 @@ import numpy
 from firedrake import (derivative, Function,
                        NonlinearVariationalProblem,
                        NonlinearVariationalSolver)
+from ufl import replace as ufl_replace
 from ufl.constantvalue import as_ufl
+from ufl.algorithms.analysis import extract_type
 
-from .ufl.deriv import TimeDerivative, expand_time_derivatives
+from .ufl.deriv import (TimeDerivative, ConservativeTimeDerivative,
+                         expand_time_derivatives)
 from .constant import vecconst
 from .tools import replace
 from .constant import MeshConstant
 from .bcs import bc2space
 
 
-def getFormDIRK(F, ks, butch, t, dt, u0, bcs=None, kgac=None):
+def _replace_conservative_dts(F, u0, k, dt, W_prev, b_val):
+    """Replace ConservativeTimeDerivative nodes with finite-difference forms.
+
+    For each ConservativeTimeDerivative(f(u0)) in F, produce:
+
+        (f(W_prev + b_val*dt*k) - f(W_prev)) / (b_val * dt)
+
+    where W_prev is the cumulative b-weighted update from previous stages
+    and b_val is the current stage's b-weight.  The telescoping sum over
+    stages yields exact global conservation: sum_i (f(W_i) - f(W_{i-1}))
+    = f(u_new) - f(u_old).
+
+    Returns the modified form.  If F contains no ConservativeTimeDerivative
+    nodes, it is returned unchanged.
+    """
+    conservative_dts = extract_type(F, ConservativeTimeDerivative)
+    if not conservative_dts:
+        return F
+
+    for cdt in conservative_dts:
+        f_expr, = cdt.ufl_operands
+        f_at_new = ufl_replace(f_expr, {u0: W_prev + b_val * dt * k})
+        f_at_old = ufl_replace(f_expr, {u0: W_prev})
+        finite_diff = (f_at_new - f_at_old) / (b_val * dt)
+        F = ufl_replace(F, {cdt: finite_diff})
+
+    return F
+
+
+def getFormDIRK(F, ks, butch, t, dt, u0, bcs=None, kgac=None,
+                conservative_vars=None):
     if bcs is None:
         bcs = []
 
@@ -34,7 +67,22 @@ def getFormDIRK(F, ks, butch, t, dt, u0, bcs=None, kgac=None):
     else:
         k, g, a, c = kgac
 
-    # preprocess time derivatives
+    # Check whether the form contains ConservativeTimeDerivative nodes.
+    has_conservative = bool(extract_type(F, ConservativeTimeDerivative))
+
+    if has_conservative:
+        if conservative_vars is None:
+            W_prev = Function(V)
+            b_val = MC.Constant(1.0)
+        else:
+            W_prev, b_val = conservative_vars
+        F = _replace_conservative_dts(F, u0, k, dt, W_prev, b_val)
+    else:
+        W_prev = None
+        b_val = None
+
+    # preprocess time derivatives (chain rule for standard Dt, skips
+    # ConservativeTimeDerivative which was already replaced above)
     F = expand_time_derivatives(F, t=t, timedep_coeffs=(u0,))
 
     repl = {t: t + c * dt,
@@ -63,7 +111,7 @@ def getFormDIRK(F, ks, butch, t, dt, u0, bcs=None, kgac=None):
             gdat /= d_val * dt
             bcnew.append(bc.reconstruct(g=gdat))
 
-    return stage_F, (k, g, a, c), bcnew, (a_vals, d_val)
+    return stage_F, (k, g, a, c), bcnew, (a_vals, d_val), (W_prev, b_val)
 
 
 class DIRKTimeStepper:
@@ -120,12 +168,22 @@ class DIRKTimeStepper:
         # that we update as we go.  We need to remember the
         # stage values we've computed earlier in the time step...
 
-        stage_F, kgac, bcnew, (a_vals, d_val) = getFormDIRK(
+        stage_F, kgac, bcnew, (a_vals, d_val), (W_prev, b_val) = getFormDIRK(
             F, self.ks, butcher_tableau, t, dt, u0, bcs=bcs)
         k, g, a, c = kgac
         self.kgac = kgac
         self.bcnew = bcnew
         self.bc_constants = a_vals, d_val
+        self.W_prev = W_prev
+        self.b_val = b_val
+
+        # Guard: ConservativeDt requires all b-weights to be nonzero
+        if W_prev is not None:
+            if any(butcher_tableau.b[i] == 0.0 for i in range(num_stages)):
+                raise ValueError(
+                    "ConservativeDt requires all b-weights to be nonzero. "
+                    f"Got b = {butcher_tableau.b}"
+                )
 
         stage_Jp = None
         if Fp is not None:
@@ -171,6 +229,13 @@ class DIRKTimeStepper:
         ks = self.ks
         u0 = self.u0
         dt = self.dt
+        W_prev = self.W_prev
+        b_val = self.b_val
+
+        # Initialise the cumulative b-weighted update point: W_0 = u0
+        if W_prev is not None:
+            W_prev.assign(u0)
+
         for i in range(self.num_stages):
             # compute the already-known part of the state in the
             # variational form
@@ -179,6 +244,10 @@ class DIRKTimeStepper:
             # update BC constants for the variational problem
             self.update_bc_constants(i, c)
             a.assign(self.AA[i, i])
+
+            # update the b-weight constant for conservative mass term
+            if b_val is not None:
+                b_val.assign(self.BB[i])
 
             # solve new variational problem, stash the computed
             # stage value.
@@ -193,6 +262,10 @@ class DIRKTimeStepper:
             self.num_linear_iterations += self.solver.snes.getLinearSolveIterations()
             ks[i].assign(k)
 
+            # advance the cumulative b-weighted update: W_i = W_{i-1} + b_i*dt*K_i
+            if W_prev is not None:
+                W_prev += ks[i] * (self.BB[i] * dt)
+
         # update the solution with now-computed stage values.
         u0 += sum(ks[i] * (self.BB[i] * dt) for i in range(self.num_stages))
 
@@ -204,9 +277,12 @@ class DIRKTimeStepper:
     def get_form_and_bcs(self, stages, F=None, bcs=None, tableau=None):
         if bcs is None:
             bcs = self.orig_bcs
-        return getFormDIRK(F or self.F,
-                           stages,
-                           tableau or self.butcher_tableau,
-                           self.t, self.dt,
-                           self.u0,
-                           bcs=bcs, kgac=self.kgac)
+        cv = (self.W_prev, self.b_val) if self.W_prev is not None else None
+        result = getFormDIRK(F or self.F,
+                             stages,
+                             tableau or self.butcher_tableau,
+                             self.t, self.dt,
+                             self.u0,
+                             bcs=bcs, kgac=self.kgac,
+                             conservative_vars=cv)
+        return result[:4]  # Original callers expect 4-tuple
