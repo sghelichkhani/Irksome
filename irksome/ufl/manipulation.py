@@ -11,19 +11,119 @@ from itertools import chain
 from operator import or_
 from typing import NamedTuple, Sequence, FrozenSet
 
+from ufl.algorithms.analysis import extract_type
 from ufl.corealg.traversal import traverse_unique_terminals
 from ufl.corealg.dag_traverser import DAGTraverser
 from ufl.classes import (
     BaseForm, CellAvg, Coefficient, ComponentTensor,
-    Conj, Cross, Derivative, Division, Dot, Expr, FacetAvg,
-    Form, FormSum, Indexed, IndexSum, Inner, Integral,
+    Conj, Cross, Curl, Derivative, Div, Division, Dot, Expr, FacetAvg,
+    Form, FormSum, Grad, Indexed, IndexSum, Inner, Integral,
     ListTensor, MultiIndex, NegativeRestricted, Outer, PositiveRestricted,
-    Product, Sum, Variable,
+    Product, ReferenceGrad, ReferenceValue, Sum, Variable,
 )
 
 from .deriv import TimeDerivative
 
-__all__ = ("SplitTimeForm", "check_integrals", "split_time_derivative_terms", "remove_time_derivatives")
+__all__ = ("SplitTimeForm", "check_integrals", "split_time_derivative_terms",
+           "remove_time_derivatives", "has_composite_time_derivative")
+
+
+# UFL classes that propagate the chain rule linearly through their
+# operands.  Mirrors the ``terminal_modifier`` rule list in
+# ``TimeDerivativeRuleset`` plus the structural compositors that build
+# vector- and mixed-function views (ListTensor, IndexSum, ComponentTensor)
+# and facet/restriction operators that appear in DG forms (Restricted,
+# CellAvg, FacetAvg).  A TimeDerivative whose operand is built only from
+# these classes wrapping the prognostic variable u0 is safe to chain-rule:
+# the result is ``Dt(u0)`` (or an Indexed view of it) and the standard
+# substitution in the steppers handles it correctly.
+_PASS_THROUGH_OPS = (
+    CellAvg, ComponentTensor, Conj, Curl, Div, FacetAvg, Grad, Indexed,
+    IndexSum, ListTensor, NegativeRestricted, PositiveRestricted,
+    ReferenceGrad, ReferenceValue, Variable,
+)
+
+
+def _depends_on(expr, u0):
+    """True iff ``u0`` appears as a terminal in ``expr``."""
+    return u0 in traverse_unique_terminals(expr)
+
+
+def _is_pass_through(f, u0):
+    """True iff ``f`` is u0 wrapped in a tree of UFL operations that are
+    linear in u0.  Used by :func:`has_composite_time_derivative` to
+    decide whether ``Dt(f)`` is safe to chain-rule (``True``) or
+    represents ``Dt(g(u0))`` for some nonlinear g (``False``).
+
+    Linear operations come in two flavours.  Structural / unary linear
+    ops (in ``_PASS_THROUGH_OPS``) propagate linearity through their
+    only operand.  Algebraic binary ops (``Sum``, ``Product``,
+    ``Division``) are linear under restricted conditions: a sum is
+    linear iff each summand is either u0-independent or itself linear
+    in u0; a product is linear iff at most one factor depends on u0
+    and that factor is itself linear; a quotient is linear iff its
+    denominator does not depend on u0 and the numerator is linear.
+    """
+    if f is u0:
+        return True
+    if isinstance(f, MultiIndex):
+        return True
+    if isinstance(f, _PASS_THROUGH_OPS):
+        return all(_is_pass_through(c, u0) for c in f.ufl_operands)
+    if isinstance(f, Sum):
+        return all((not _depends_on(c, u0)) or _is_pass_through(c, u0)
+                   for c in f.ufl_operands)
+    if isinstance(f, Product):
+        deps = [_depends_on(c, u0) for c in f.ufl_operands]
+        if sum(deps) > 1:
+            return False
+        return all((not dep) or _is_pass_through(c, u0)
+                   for c, dep in zip(f.ufl_operands, deps))
+    if isinstance(f, Division):
+        num, den = f.ufl_operands
+        if _depends_on(den, u0):
+            return False
+        return (not _depends_on(num, u0)) or _is_pass_through(num, u0)
+    return False
+
+
+def has_composite_time_derivative(F, u0):
+    """True iff ``F`` contains a TimeDerivative of a non-trivial expression
+    in u0 -- i.e. ``Dt(g(u0))`` for some nonlinear g.  These cases lose
+    mass conservation when chain-ruled through the stage-derivative form,
+    and require the conservative two-evaluation discretisation.
+
+    Cases that are NOT flagged:
+
+    * ``Dt(u0)``                     -- the prognostic variable itself
+    * ``Dt(u0[i])`` / ``Dt(split(u0))`` -- structural views for mixed/vector spaces
+    * ``Dt(grad(u0))`` and other linear differential operators
+    * ``Dt(u0('+'))`` and other facet restrictions
+    * ``Dt(c*u0)``, ``Dt(u0/c)``, ``Dt(u0 + h(t))`` -- u0 multiplied or
+      offset by anything that does not itself depend on u0
+    * ``Dt(f(t, x))``                -- operand does not involve u0 at all
+
+    .. warning::
+
+       The detection is purely *syntactic*: it checks whether ``u0``
+       appears as a UFL terminal under ``Dt``.  If a user creates an
+       intermediate :class:`~firedrake.Function` whose values were
+       interpolated from an expression in u0 and then writes
+       ``Dt(that_intermediate)``, the syntactic dependence on u0 is
+       lost and this function will declare the form safe.  The
+       resulting discretisation is *not* mass-conservative.  Always
+       wrap the symbolic expression directly in ``Dt`` (as
+       ``Dt(theta(u))``, not ``Dt(theta_function)``).
+    """
+    for td in extract_type(F, TimeDerivative):
+        f, = td.ufl_operands
+        if not _depends_on(f, u0):
+            # Dt(f(t,x)) -- chain-ruled analytically, no u0 dependence
+            continue
+        if _is_pass_through(f, u0):
+            continue
+        return True
+    return False
 
 
 class SplitTimeForm(NamedTuple):

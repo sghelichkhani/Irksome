@@ -11,7 +11,9 @@ from ufl.constantvalue import as_ufl
 from .bcs import stage2spaces4bc
 from .tableaux.ButcherTableaux import CollocationButcherTableau
 from .ufl.deriv import expand_time_derivatives
-from .ufl.manipulation import split_time_derivative_terms, remove_time_derivatives
+from .ufl.manipulation import (has_composite_time_derivative,
+                               split_time_derivative_terms,
+                               remove_time_derivatives)
 from .tools import AI, dot, reshape, replace
 from .constant import vecconst
 from .base_time_stepper import StageCoupledTimeStepper
@@ -199,6 +201,23 @@ class StageValueTimeStepper(StageCoupledTimeStepper):
             assert (self.basis_type is None or self.basis_type == "Lagrange"), "Collocation update requires the Lagrange form of the collocation polynomial"
             assert (len(set(nodes)) == self.butcher_tableau.num_stages + 1), "Need a non-confluent collocation method to use collocation update"
 
+            # The collocation update evaluates the collocation polynomial
+            # at t=1 as a linear combination of u0 and the stages.  That
+            # combination is not mass-conservative when Dt(g(u)) has a
+            # nonlinear g, because g(linear combo) != linear combo of
+            # g(stage_i).  Refuse rather than silently returning a
+            # non-conservative answer; users can disable use_collocation_update
+            # to fall back to the conservative variational update path.
+            if has_composite_time_derivative(F, u0):
+                raise NotImplementedError(
+                    "use_collocation_update=True is incompatible with "
+                    "Dt(g(u)) for a nonlinear g of the prognostic variable: "
+                    "the collocation polynomial's terminal value is a "
+                    "linear combination of stages and is not "
+                    "mass-conservative.  Disable use_collocation_update "
+                    "to use the conservative variational update."
+                )
+
             lag_basis = LagrangePolynomialSet(ufc_simplex(1), nodes)
             collocation_vander = vecconst(lag_basis.tabulate((1.0,))[(0,)])
 
@@ -206,15 +225,38 @@ class StageValueTimeStepper(StageCoupledTimeStepper):
             self._update = self._update_collocation
 
         elif (not butcher_tableau.is_stiffly_accurate) and (basis_type != "Bernstein"):
-            try:
-                A = butcher_tableau.A
-                b = butcher_tableau.b
-                self.bAinv = vecconst(numpy.linalg.solve(A.T, b))
-                self.update_scale = 1-numpy.sum(self.bAinv)
-                self._update = self._update_Ainv
-            except numpy.linalg.LinAlgError:
+            # For composite Dt(g(u)) we need the conservative variational
+            # update; the bAinv linear combination of stages is correct
+            # for g = identity but breaks for nonlinear g.  For the
+            # linear case we keep the bAinv shortcut: it is conservative
+            # by construction (g = id makes both formulations agree)
+            # AND it handles DAEs correctly, which the conservative
+            # variational update does not (it leaves the algebraic
+            # components of u_new unconstrained, producing a singular
+            # update Jacobian).
+            if has_composite_time_derivative(F, u0):
+                # Note: composite Dt(g(u)) on a DAE form (where some
+                # component of u0 has no time evolution) is not
+                # supported by this path -- the conservative variational
+                # update leaves the algebraic block unconstrained, and
+                # SNES will fail with a singular linear solve.  We do
+                # not detect this up-front because the available
+                # syntactic checks (is_ode etc.) are confused by the
+                # chain-rule promotion of Dt(u[i]) -> Dt(u)[i].  Stiffly
+                # accurate methods (RadauIIA, BackwardEuler) avoid this
+                # since u_new = U_s and no update solve is needed.
                 self.unew, self.update_solver = self.get_update_solver(update_solver_parameters)
                 self._update = self._update_general
+            else:
+                try:
+                    A = butcher_tableau.A
+                    b = butcher_tableau.b
+                    self.bAinv = vecconst(numpy.linalg.solve(A.T, b))
+                    self.update_scale = 1-numpy.sum(self.bAinv)
+                    self._update = self._update_Ainv
+                except numpy.linalg.LinAlgError:
+                    self.unew, self.update_solver = self.get_update_solver(update_solver_parameters)
+                    self._update = self._update_general
         else:
             self._update = self._update_stiff_acc
 
@@ -232,20 +274,33 @@ class StageValueTimeStepper(StageCoupledTimeStepper):
             u0bit.assign(self.stages.subfunctions[self.num_fields*(self.num_stages-1)+i])
 
     def get_update_solver(self, update_solver_parameters):
-        # only form update stuff if we need it
-        # which means neither stiffly accurate nor Vandermonde
-        v, = self.F.arguments()
-        unew = Function(self.u0.function_space())
-        Fupdate = inner(unew - self.u0, v) * dx
-
-        C = vecconst(self.butcher_tableau.c)
-        B = vecconst(self.butcher_tableau.b)
+        # Build a conservative variational update for u_new from the
+        # stage values.  The head is the same two-evaluation form used
+        # in the stage equations, evaluated at unew and u0:
+        #
+        #     replace(F_dtless, {u0: unew}) - replace(F_dtless, {u0: u0})
+        #
+        # which expands to inner(g(unew) - g(u0), v)*dx for the typical
+        # mass term inner(Dt(g(u)), v)*dx.  For g = identity this is
+        # exactly inner(unew - u0, v)*dx -- the previous head -- so the
+        # discrete update equation is unchanged in the linear case.
         F = self.F
         t = self.t
         dt = self.dt
         u0 = self.u0
+        unew = Function(u0.function_space())
+
         split_form = split_time_derivative_terms(F, t=t, timedep_coeffs=(u0,))
+        F_dtless = remove_time_derivatives(split_form.time)
         F_remainder = expand_time_derivatives(split_form.remainder, t=t, timedep_coeffs=())
+
+        # Two-evaluation conservative head.  Subtracting the two
+        # replaced forms keeps the test function v unchanged in both,
+        # so the result is a single Form valid for assembly.
+        Fupdate = replace(F_dtless, {u0: unew}) - replace(F_dtless, {u0: u0})
+
+        C = vecconst(self.butcher_tableau.c)
+        B = vecconst(self.butcher_tableau.b)
         u_np = to_value(self.u0, self.stages, self.vandermonde)
 
         for i in range(self.num_stages):
